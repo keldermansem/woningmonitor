@@ -1,0 +1,38 @@
+{
+  "/woningaanbod/huur/rotterdam/noorderhavenkade/29-a": {
+    "eerst_gezien": "2026-08-20T13:47:14+00:00",
+    "status": "beschikbaar",
+    "title": "Noorderhavenkade 29A 3039RE Rotterdam € 1.181,33 /mnd",
+    "url": "https://www.rentalrotterdam.nl/woningaanbod/huur/rotterdam/noorderhavenkade/29-a"
+  },
+  "/woningaanbod/huur/rotterdam/noordsingel/48-a01": {
+    "eerst_gezien": "2026-08-20T13:47:14+00:00",
+    "status": "beschikbaar",
+    "title": "Noordsingel 48A01 3032BE Rotterdam € 1.161,49 /mnd",
+    "url": "https://www.rentalrotterdam.nl/woningaanbod/huur/rotterdam/noordsingel/48-a01"
+  },
+  "/woningaanbod/huur/rotterdam/soetensteeg/48": {
+    "eerst_gezien": "2026-08-20T13:47:14+00:00",
+    "status": "beschikbaar",
+    "title": "Soetensteeg 48 3011GS Rotterdam € 1.157,51 /mnd",
+    "url": "https://www.rentalrotterdam.nl/woningaanbod/huur/rotterdam/soetensteeg/48"
+  },
+  "/woningaanbod/huur/rotterdam/spinozaweg/251": {
+    "eerst_gezien": "2026-08-20T13:47:14+00:00",
+    "status": "beschikbaar",
+    "title": "Spinozaweg 251 3076EN Rotterdam € 1.127,61 /mnd",
+    "url": "https://www.rentalrotterdam.nl/woningaanbod/huur/rotterdam/spinozaweg/251"
+  },
+  "/woningaanbod/huur/rotterdam/van-speykstraat/149-b03": {
+    "eerst_gezien": "2026-08-20T13:47:14+00:00",
+    "status": "verhuurd",
+    "title": "Van Speykstraat 149B03, 3014VJ Rotterdam",
+    "url": "https://www.rentalrotterdam.nl/woningaanbod/huur/rotterdam/van-speykstraat/149-b03"
+  },
+  "/woningaanbod/huur/rotterdam/waterloostraat/97-a": {
+    "eerst_gezien": "2026-08-20T13:47:14+00:00",
+    "status": "verhuurd",
+    "title": "Waterloostraat 97A, 3062TJ Rotterdam",
+    "url": "https://www.rentalrotterdam.nl/woningaanbod/huur/rotterdam/waterloostraat/97-a"
+  }
+}
