@@ -32,6 +32,30 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 HIER = Path(__file__).parent
+INSTELLINGEN = HIER / "instellingen.json"
+
+
+def laad_instellingen() -> None:
+    """
+    Lees instellingen.json in, als die er is.
+
+    Op GitHub bestaat dit bestand niet en komen de gegevens uit de secrets.
+    Op je laptop staat het naast het script. Bestaande omgevingsvariabelen
+    winnen altijd, zodat GitHub nooit door een meegekomen bestand overruled
+    kan worden.
+    """
+    if not INSTELLINGEN.exists():
+        return
+    try:
+        gegevens = json.loads(INSTELLINGEN.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as fout:
+        print(f"! instellingen.json is geen geldige JSON: {fout}", file=sys.stderr)
+        print("! Let op ontbrekende komma's of aanhalingstekens.", file=sys.stderr)
+        return
+    for sleutel, waarde in gegevens.items():
+        if sleutel.startswith("_"):
+            continue  # regels die met _ beginnen zijn bedoeld als toelichting
+        os.environ.setdefault(sleutel, str(waarde))
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -47,6 +71,7 @@ SITES = [
         "opslag": "seen.json",
         "browser": True,
         "soort": "athome",
+        "wacht_op": 'a[href*="/woningaanbod/"]',
     },
     {
         "id": "rentalrotterdam",
@@ -61,6 +86,26 @@ SITES = [
         "opslag": "seen-rentalrotterdam.json",
         "browser": False,
         "soort": "rental",
+        "wacht_op": 'a[href*="/woningaanbod/"]',
+    },
+    {
+        "id": "indestad",
+        "naam": "In de Stad",
+        # per_page staat bewust op 50 in plaats van 10: dan past al het
+        # gefilterde aanbod op een pagina en hoeft er niet gebladerd te worden.
+        "url": (
+            "https://www.indestad.nl/huurwoningen/?wpp_search%5Bpagination%5D=on"
+            "&wpp_search%5Bper_page%5D=50&wpp_search%5Bstrict_search%5D=false"
+            "&wpp_search%5Bproperty_type%5D=direct_aanbod"
+            "&wpp_search%5Bprice%5D%5Bmin%5D=100&wpp_search%5Bprice%5D%5Bmax%5D=1400"
+            "&wpp_search%5Barea%5D%5Bmin%5D=44&wpp_search%5Barea%5D%5Bmax%5D=200"
+            "&wpp_search%5Bplaats%5D%5B0%5D=Rotterdam"
+        ),
+        "basis": "https://www.indestad.nl",
+        "opslag": "seen-indestad.json",
+        "browser": False,
+        "soort": "indestad",
+        "wacht_op": 'a[href*="/huurwoningen/"]',
     },
 ]
 
@@ -79,10 +124,18 @@ ANCHOR_RE = re.compile(
 )
 ATTR_TEXT_RE = re.compile(r"(?:title|alt|aria-label)=[\"']([^\"']+)[\"']", re.IGNORECASE)
 PAGINATION_RE = re.compile(r"href=[\"']([^\"']*[?&]page=\d+[^\"']*)[\"']", re.IGNORECASE)
-AANTAL_RE = re.compile(r"(\d[\d.]*)\s*object(?:en)?\s*gevonden", re.IGNORECASE)
+AANTAL_RE = re.compile(r"\b(\d[\d.]*)\s+(?:object(?:en)?\s+)?gevonden\b", re.IGNORECASE)
 TAG_RE = re.compile(r"<[^>]+>")
 WS_RE = re.compile(r"\s+")
 
+# Labels waarmee een site aangeeft dat reageren geen zin meer heeft. Alles wat
+# hier NIET tussen staat geldt als beschikbaar, ook een label dat ik nog niet
+# ken - liever een mail te veel dan een gemiste woning.
+NIET_MEER_RE = re.compile(
+    r"(bezichtiging\s+vol|zo\s+goed\s+als\s+verhuurd|\bverhuurd\b|\bverkocht\b"
+    r"|onder\s+optie|\bvol\b\s*$)",
+    re.IGNORECASE,
+)
 VERHUURD_RE = re.compile(r"\b(verhuurd|verkocht|onder\s+optie)\b", re.IGNORECASE)
 BESCHIKBAAR_RE = re.compile(r"\b(te\s+huur|te\s+koop|nieuw\s+in\s+verhuur|beschikbaar)\b", re.IGNORECASE)
 STATUS_PREFIX_RE = re.compile(r"^(?:te\s+huur|te\s+koop|verhuurd|verkocht)\s*:\s*", re.IGNORECASE)
@@ -201,7 +254,84 @@ def extract_rental(html: str, basis: str) -> dict[str, dict]:
     return gevonden
 
 
-EXTRACTORS = {"athome": extract_athome, "rental": extract_rental}
+# --------------------------------------------------------------------------
+# In de Stad: /huurwoningen/<straat-nummer>/
+#
+# Deze site zet labels als "Bezichtiging vol" NAAST de link in plaats van erin.
+# Daarom knippen we de pagina op in kaartjes: alle vindplaatsen van dezelfde
+# woning-URL vormen samen een blok, en het stukje HTML tussen het vorige blok
+# en dit blok is waar het label staat.
+# --------------------------------------------------------------------------
+
+INDESTAD_PATH_RE = re.compile(
+    r"^(?:https?://(?:www\.)?indestad\.nl)?(/huurwoningen/[^/?#]+)/?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+HREF_RE = re.compile(r"href=[\"'\']([^\"'\']+)[\"'\']", re.IGNORECASE)
+HUISNUMMER_RE = re.compile(r"^(.*?)-((?:\d+[a-z]?)(?:-\d+[a-z]?)*)$", re.IGNORECASE)
+PRIJS_RE = re.compile(r"\u20ac\s*([\d.,]+)\s*p/m", re.IGNORECASE)
+
+TUSSENVOEGSELS = {"de", "den", "der", "het", "van", "aan", "op", "ter", "te", "in", "bij", "'t"}
+LABEL_TERUGBLIK = 800  # tekens vóór een kaartje waarin we naar het label kijken
+
+
+def titel_indestad(pad: str) -> str:
+    """'/huurwoningen/pieter-de-hoochweg-3-2' -> 'Pieter de Hoochweg 3-2'."""
+    slug = pad.rstrip("/").rsplit("/", 1)[-1]
+    treffer = HUISNUMMER_RE.match(slug)
+    woorddeel, nummerdeel = (treffer.group(1), treffer.group(2)) if treffer else (slug, "")
+
+    woorden = []
+    for stand, woord in enumerate(w for w in woorddeel.split("-") if w):
+        woorden.append(woord if stand > 0 and woord in TUSSENVOEGSELS else woord.capitalize())
+    return " ".join(woorden + ([nummerdeel.upper()] if nummerdeel else [])).strip() or "Woning"
+
+
+def extract_indestad(html: str, basis: str) -> dict[str, dict]:
+    # Alle vindplaatsen van woning-links, op volgorde van voorkomen.
+    vindplaatsen: list[tuple[int, str]] = []
+    for treffer in HREF_RE.finditer(html):
+        pad_match = INDESTAD_PATH_RE.match(unescape(treffer.group(1)).strip())
+        if pad_match:
+            vindplaatsen.append((treffer.start(), pad_match.group(1).rstrip("/")))
+
+    # Opeenvolgende links naar dezelfde woning horen bij één kaartje.
+    blokken: list[list] = []
+    for positie, pad in vindplaatsen:
+        if blokken and blokken[-1][0] == pad:
+            blokken[-1][2] = positie
+        else:
+            blokken.append([pad, positie, positie])
+
+    gevonden: dict[str, dict] = {}
+    vorig_eind = 0
+    for pad, start, eind in blokken:
+        zone_start = max(vorig_eind, start - LABEL_TERUGBLIK)
+        kaartje = _clean_text(html[zone_start:eind])
+        vorig_eind = eind
+
+        woning_id = pad.lower()
+        if woning_id in gevonden:
+            continue  # eerste kaartje telt; latere herhaling negeren we
+
+        titel = titel_indestad(pad)
+        prijs = PRIJS_RE.search(kaartje)
+        if prijs:
+            titel = f"{titel} - \u20ac{prijs.group(1)} p/m"
+
+        gevonden[woning_id] = {
+            "title": titel[:200],
+            "url": urljoin(basis, pad + "/"),
+            "status": "verhuurd" if NIET_MEER_RE.search(kaartje) else "beschikbaar",
+        }
+    return gevonden
+
+
+EXTRACTORS = {
+    "athome": extract_athome,
+    "rental": extract_rental,
+    "indestad": extract_indestad,
+}
 
 
 def extract_pagination(html: str, basis: str, prefix: str) -> list[str]:
@@ -227,11 +357,12 @@ def haal_statisch(url: str) -> str:
     return ruw.decode(codering, errors="replace")
 
 
-def haal_met_browser(start_url: str, basis: str) -> list[str]:
+def haal_met_browser(site: dict) -> list[str]:
     """Render de pagina (en eventuele vervolgpagina's) en geef de HTML terug."""
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
 
+    start_url, basis = site["url"], site["basis"]
     paginas: list[str] = []
     weigeren = re.compile(r"(alleen noodzakelijk|noodzakelijke|weigeren|reject|necessary only)", re.I)
     accepteren = re.compile(r"(accepteer|akkoord|accept|toestaan)", re.I)
@@ -268,7 +399,7 @@ def haal_met_browser(start_url: str, basis: str) -> list[str]:
                         continue
 
             try:
-                page.wait_for_selector('a[href*="/woningaanbod/"]', timeout=20_000)
+                page.wait_for_selector(site["wacht_op"], timeout=20_000)
             except Exception:
                 print("     (geen woninglinks gezien binnen 20s)", flush=True)
             page.wait_for_timeout(2500)
@@ -285,7 +416,7 @@ def haal_met_browser(start_url: str, basis: str) -> list[str]:
 
             html = page.content()
             paginas.append(html)
-            for volgende in extract_pagination(html, basis, f"{basis}/woningaanbod"):
+            for volgende in extract_pagination(html, basis, start_url.split("?")[0]):
                 if volgende not in bezocht and volgende not in wachtrij:
                     wachtrij.append(volgende)
 
@@ -334,7 +465,7 @@ def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
     paginas: list[str] = []
     try:
         if site["browser"]:
-            paginas = haal_met_browser(site["url"], site["basis"])
+            paginas = haal_met_browser(site)
         else:
             print(f"     ophalen: {site['url'][:90]}...", flush=True)
             paginas = [haal_statisch(site["url"])]
@@ -350,7 +481,7 @@ def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
     if not huidig and not site["browser"]:
         print("     niets gevonden zonder browser; nog een poging mét browser", flush=True)
         try:
-            for html in haal_met_browser(site["url"], site["basis"]):
+            for html in haal_met_browser(site):
                 huidig.update(extractor(html, site["basis"]))
         except Exception as fout:
             print(f"! Ook met browser mislukt: {fout}", file=sys.stderr)
@@ -426,6 +557,14 @@ def verstuur_mail(nieuw: list[dict]) -> None:
     else:
         onderwerp = f"{aantal} nieuwe huurwoningen"
 
+    # Zodat je ziet of deze mail van je laptop of van GitHub komt. Op GitHub
+    # wordt GITHUB_ACTIONS altijd gezet, dus dat hoef je nergens in te vullen.
+    label = os.environ.get("MONITOR_LABEL")
+    if label is None:
+        label = "github" if os.environ.get("GITHUB_ACTIONS") == "true" else ""
+    if label.strip():
+        onderwerp = f"[{label.strip()}] {onderwerp}"
+
     regels: list[str] = []
     blokken: list[str] = []
     for sitenaam, woningen in per_site.items():
@@ -472,6 +611,7 @@ def verstuur_mail(nieuw: list[dict]) -> None:
 # --------------------------------------------------------------------------
 
 def main() -> int:
+    laad_instellingen()
     print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}] Controle gestart", flush=True)
 
     resultaten: list[tuple[dict, list[dict], dict]] = []
