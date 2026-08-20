@@ -4,7 +4,7 @@ on:
   schedule:
     # Elk kwartier. GitHub houdt zich hier losjes aan bij drukte;
     # reken op een marge van 5 tot 15 minuten.
-    - cron: "*/15 * * * *"
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch: # knop om handmatig te starten
 
 permissions:
