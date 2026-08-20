@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Monitor voor nieuw woningaanbod van At Home Vastgoed (athomevastgoed.nl).
+Monitor voor nieuw huuraanbod, voor meerdere makelaarssites tegelijk.
 
-De woningen op de site worden via JavaScript ingeladen, dus we renderen de
-pagina met een echte (headless) browser. Elke woning heeft een eigen URL met
-een uniek nummer aan het eind, bijvoorbeeld:
+Per site wordt bijgehouden welke woningen al eens langs zijn gekomen. Verschijnt
+er iets nieuws dat ook daadwerkelijk beschikbaar is, dan gaat er een mail uit.
 
-    /woningaanbod/huren-appartement-rotterdam-crooswijkseweg-te-huur-5251
-
-Dat nummer gebruiken we als vingerafdruk. Zien we een nummer dat nog niet in
-seen.json staat, dan is het nieuw aanbod en gaat er een mail uit.
+Nieuwe site toevoegen? Zet er een blok bij in SITES hieronder. Sites die hun
+aanbod pas met JavaScript inladen krijgen "browser": True; de rest niet, want
+zonder browser is een controle een paar seconden in plaats van een minuut.
 
 Instellen via omgevingsvariabelen (zie README.md):
     SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, MAIL_TO
@@ -25,265 +23,450 @@ import re
 import smtplib
 import ssl
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from html import unescape
 from pathlib import Path
 from urllib.parse import urljoin
 
-BASE_URL = "https://www.athomevastgoed.nl"
-LIST_URL = f"{BASE_URL}/woningaanbod"
-STATE_FILE = Path(__file__).with_name("seen.json")
+HIER = Path(__file__).parent
 
-MAX_PAGES = 6          # hoeveel paginanummers we maximaal bezoeken
-MAX_LOAD_MORE = 8      # hoe vaak we op een 'toon meer'-knop klikken
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+SITES = [
+    {
+        "id": "athomevastgoed",
+        "naam": "At Home Vastgoed",
+        "url": "https://www.athomevastgoed.nl/woningaanbod",
+        "basis": "https://www.athomevastgoed.nl",
+        "opslag": "seen.json",
+        "browser": True,
+        "soort": "athome",
+    },
+    {
+        "id": "rentalrotterdam",
+        "naam": "Rental Rotterdam",
+        "url": (
+            "https://www.rentalrotterdam.nl/woningaanbod/huur/rotterdam/"
+            "type-appartement,woonhuis?locationofinterest=Rotterdam"
+            "&minlivablearea=25&minrooms=2&moveunavailablelistingstothebottom=true"
+            "&pricerange.maxprice=1500&pricerange.minprice=100"
+        ),
+        "basis": "https://www.rentalrotterdam.nl",
+        "opslag": "seen-rentalrotterdam.json",
+        "browser": False,
+        "soort": "rental",
+    },
+]
+
+MAX_PAGES = 6
+MAX_LOAD_MORE = 8
 PAGE_TIMEOUT_MS = 45_000
 
 
 # --------------------------------------------------------------------------
-# HTML uitlezen (los van de browser, zodat dit apart te testen is)
+# Gereedschap voor het uitlezen van HTML
 # --------------------------------------------------------------------------
 
 ANCHOR_RE = re.compile(
-    r"<a\b[^>]*?href=[\"'](?P<href>[^\"']+)[\"'][^>]*>(?P<inner>.*?)</a>",
+    r"<a\b(?P<attrs>[^>]*?)href=[\"'](?P<href>[^\"']+)[\"'](?P<rest>[^>]*)>(?P<inner>.*?)</a>",
     re.IGNORECASE | re.DOTALL,
 )
-LISTING_PATH_RE = re.compile(r"^(?:https?://(?:www\.)?athomevastgoed\.nl)?(/woningaanbod/[^?#]+)$", re.I)
-LISTING_ID_RE = re.compile(r"-(\d+)/?$")
-PAGINATION_RE = re.compile(r"href=[\"']([^\"']*[?&]page=\d+[^\"']*)[\"']", re.I)
+ATTR_TEXT_RE = re.compile(r"(?:title|alt|aria-label)=[\"']([^\"']+)[\"']", re.IGNORECASE)
+PAGINATION_RE = re.compile(r"href=[\"']([^\"']*[?&]page=\d+[^\"']*)[\"']", re.IGNORECASE)
+AANTAL_RE = re.compile(r"(\d[\d.]*)\s*object(?:en)?\s*gevonden", re.IGNORECASE)
 TAG_RE = re.compile(r"<[^>]+>")
 WS_RE = re.compile(r"\s+")
 
+VERHUURD_RE = re.compile(r"\b(verhuurd|verkocht|onder\s+optie)\b", re.IGNORECASE)
+BESCHIKBAAR_RE = re.compile(r"\b(te\s+huur|te\s+koop|nieuw\s+in\s+verhuur|beschikbaar)\b", re.IGNORECASE)
+STATUS_PREFIX_RE = re.compile(r"^(?:te\s+huur|te\s+koop|verhuurd|verkocht)\s*:\s*", re.IGNORECASE)
+
 
 def _clean_text(raw_html: str) -> str:
-    """Haal tags weg en normaliseer witruimte."""
     return WS_RE.sub(" ", unescape(TAG_RE.sub(" ", raw_html))).strip()
 
 
-def title_from_slug(path: str) -> str:
-    """
-    'huren-appartement-rotterdam-crooswijkseweg-te-huur-5251'
-      -> 'Appartement Rotterdam Crooswijkseweg'
-    Betrouwbare terugvaloptie als de linktekst leeg is.
-    """
+def _status_uit(raw_anchor: str) -> str:
+    """Lees uit een kaartje of de woning nog te huur is."""
+    if VERHUURD_RE.search(raw_anchor):
+        return "verhuurd"
+    if BESCHIKBAAR_RE.search(raw_anchor):
+        return "beschikbaar"
+    return "beschikbaar"  # bij twijfel liever een mail te veel dan te weinig
+
+
+def _beste_titel(match: re.Match) -> str:
+    """Kies de mooiste omschrijving uit linktekst, title, alt of aria-label."""
+    kandidaten = [_clean_text(match.group("inner"))]
+    for stuk in (match.group("attrs"), match.group("rest"), match.group("inner")):
+        kandidaten += [unescape(t).strip() for t in ATTR_TEXT_RE.findall(stuk)]
+
+    beste = ""
+    for kandidaat in kandidaten:
+        kandidaat = STATUS_PREFIX_RE.sub("", kandidaat).strip()
+        if len(kandidaat) < 6 or kandidaat.lower() in {"bekijk woning", "lees meer", "meer info", "bekijk details"}:
+            continue
+        if len(kandidaat) > len(beste):
+            beste = kandidaat
+    return beste[:200]
+
+
+# --------------------------------------------------------------------------
+# At Home Vastgoed: uniek nummer aan het eind van de URL
+# --------------------------------------------------------------------------
+
+ATHOME_PATH_RE = re.compile(
+    r"^(?:https?://(?:www\.)?athomevastgoed\.nl)?(/woningaanbod/[^?#]+)$", re.IGNORECASE
+)
+ATHOME_ID_RE = re.compile(r"-(\d+)/?$")
+
+
+def titel_uit_slug(path: str) -> str:
     slug = path.rstrip("/").rsplit("/", 1)[-1]
-    slug = LISTING_ID_RE.sub("", slug)
-    for junk in ("huren-", "huur-", "te-huur", "te-koop", "kopen-"):
-        slug = slug.replace(junk, " ")
-    words = [w for w in slug.replace("-", " ").split() if w]
-    return " ".join(w.capitalize() for w in words) or "Woning"
+    slug = ATHOME_ID_RE.sub("", slug)
+    for rommel in ("huren-", "huur-", "te-huur", "te-koop", "kopen-"):
+        slug = slug.replace(rommel, " ")
+    woorden = [w for w in slug.replace("-", " ").split() if w]
+    return " ".join(w.capitalize() for w in woorden) or "Woning"
 
 
-def extract_listings(html: str) -> dict[str, dict]:
-    """Geef alle woningen terug die in deze HTML staan, als {id: {...}}."""
-    found: dict[str, dict] = {}
-
+def extract_athome(html: str, basis: str) -> dict[str, dict]:
+    gevonden: dict[str, dict] = {}
     for match in ANCHOR_RE.finditer(html):
-        href = match.group("href").strip()
-        path_match = LISTING_PATH_RE.match(href)
-        if not path_match:
+        pad_match = ATHOME_PATH_RE.match(match.group("href").strip())
+        if not pad_match:
+            continue
+        pad = pad_match.group(1)
+        id_match = ATHOME_ID_RE.search(pad)
+        if not id_match:
             continue
 
-        path = path_match.group(1)
-        id_match = LISTING_ID_RE.search(path)
-        if not id_match:
-            continue  # bijv. /woningaanbod/filter -- geen echte woning
-
-        listing_id = id_match.group(1)
-        text = _clean_text(match.group("inner"))
-        # Linktekst is vaak alleen "Bekijk woning" of leeg; dan de slug gebruiken.
-        if len(text) < 8 or text.lower() in {"bekijk woning", "lees meer", "meer info"}:
-            text = title_from_slug(path)
-
-        existing = found.get(listing_id)
-        if existing is None or len(text) > len(existing["title"]):
-            found[listing_id] = {"title": text[:200], "url": urljoin(BASE_URL, path)}
-
-    return found
+        titel = _beste_titel(match) or titel_uit_slug(pad)
+        woning_id = id_match.group(1)
+        bestaand = gevonden.get(woning_id)
+        if bestaand is None or len(titel) > len(bestaand["title"]):
+            gevonden[woning_id] = {
+                "title": titel,
+                "url": urljoin(basis, pad),
+                "status": "beschikbaar",  # deze site toont geen status in de lijst
+            }
+    return gevonden
 
 
-def extract_pagination(html: str) -> list[str]:
-    """Vind links naar volgende pagina's (?page=2 enzovoort)."""
+# --------------------------------------------------------------------------
+# Rental Rotterdam: /woningaanbod/huur/<plaats>/<straat>/<nummer>
+# --------------------------------------------------------------------------
+
+RENTAL_PATH_RE = re.compile(
+    r"^(?:https?://(?:www\.)?rentalrotterdam\.nl)?"
+    r"(/woningaanbod/(?:huur|koop)/[^/?#]+/[^/?#]+/[^/?#]+?)(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+
+
+def titel_uit_adres(pad: str) -> str:
+    delen = [d for d in pad.split("/") if d]
+    straat, nummer = delen[-2], delen[-1]
+    straat = " ".join(w.capitalize() for w in straat.replace("-", " ").split())
+    return f"{straat} {nummer.upper()}".strip()
+
+
+def extract_rental(html: str, basis: str) -> dict[str, dict]:
+    gevonden: dict[str, dict] = {}
+    for match in ANCHOR_RE.finditer(html):
+        pad_match = RENTAL_PATH_RE.match(match.group("href").strip())
+        if not pad_match:
+            continue
+        pad = pad_match.group(1).rstrip("/")
+        woning_id = pad.lower()
+
+        titel = _beste_titel(match) or titel_uit_adres(pad)
+        status = _status_uit(match.group(0))
+
+        bestaand = gevonden.get(woning_id)
+        if bestaand is None or len(titel) > len(bestaand["title"]):
+            gevonden[woning_id] = {
+                "title": titel,
+                "url": urljoin(basis, pad),
+                "status": status,
+            }
+        elif bestaand["status"] == "beschikbaar" and status == "verhuurd":
+            bestaand["status"] = "verhuurd"  # verhuurd wint van te huur
+    return gevonden
+
+
+EXTRACTORS = {"athome": extract_athome, "rental": extract_rental}
+
+
+def extract_pagination(html: str, basis: str, prefix: str) -> list[str]:
     urls = []
     for href in PAGINATION_RE.findall(html):
-        full = urljoin(BASE_URL, unescape(href))
-        if full.startswith(f"{BASE_URL}/woningaanbod") and full not in urls:
-            urls.append(full)
+        volledig = urljoin(basis, unescape(href))
+        if volledig.startswith(prefix) and volledig not in urls:
+            urls.append(volledig)
     return urls
 
 
 # --------------------------------------------------------------------------
-# De site ophalen met een echte browser
+# Pagina's ophalen
 # --------------------------------------------------------------------------
 
-def _dismiss_cookiebanner(page) -> None:
-    """Klik een cookiemelding weg. Voorkeur voor 'alleen noodzakelijk'."""
+def haal_statisch(url: str) -> str:
+    verzoek = urllib.request.Request(
+        url, headers={"User-Agent": USER_AGENT, "Accept-Language": "nl-NL,nl;q=0.9"}
+    )
+    with urllib.request.urlopen(verzoek, timeout=30) as antwoord:
+        ruw = antwoord.read()
+        codering = antwoord.headers.get_content_charset() or "utf-8"
+    return ruw.decode(codering, errors="replace")
+
+
+def haal_met_browser(start_url: str, basis: str) -> list[str]:
+    """Render de pagina (en eventuele vervolgpagina's) en geef de HTML terug."""
     from playwright.sync_api import Error as PlaywrightError
-
-    patterns = [
-        re.compile(r"(alleen noodzakelijk|noodzakelijke|weigeren|reject|necessary only)", re.I),
-        re.compile(r"(accepteer|akkoord|accept|toestaan)", re.I),
-    ]
-    for pattern in patterns:
-        try:
-            button = page.get_by_role("button", name=pattern).first
-            if button.count() and button.is_visible():
-                button.click(timeout=3000)
-                page.wait_for_timeout(500)
-                return
-        except (PlaywrightError, AssertionError):
-            continue
-
-
-def _click_load_more(page) -> None:
-    """Klik herhaaldelijk op een 'toon meer'-knop, als die bestaat."""
-    from playwright.sync_api import Error as PlaywrightError
-
-    label = re.compile(r"(laad meer|toon meer|meer laden|meer resultaten|load more|show more)", re.I)
-    for _ in range(MAX_LOAD_MORE):
-        try:
-            button = page.get_by_role("button", name=label).first
-            if not button.count() or not button.is_visible():
-                return
-            button.click(timeout=5000)
-            page.wait_for_timeout(1500)
-        except (PlaywrightError, AssertionError):
-            return
-
-
-def fetch_current_listings() -> dict[str, dict]:
-    """Render het woningaanbod (incl. eventuele vervolgpagina's) en lees het uit."""
     from playwright.sync_api import sync_playwright
 
-    listings: dict[str, dict] = {}
+    paginas: list[str] = []
+    weigeren = re.compile(r"(alleen noodzakelijk|noodzakelijke|weigeren|reject|necessary only)", re.I)
+    accepteren = re.compile(r"(accepteer|akkoord|accept|toestaan)", re.I)
+    meer = re.compile(r"(laad meer|toon meer|meer laden|meer resultaten|load more|show more)", re.I)
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
         context = browser.new_context(
             locale="nl-NL",
             viewport={"width": 1400, "height": 1000},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            ),
+            user_agent=USER_AGENT,
         )
         page = context.new_page()
 
-        queue = [LIST_URL]
-        visited: set[str] = set()
-
-        while queue and len(visited) < MAX_PAGES:
-            url = queue.pop(0)
-            if url in visited:
+        wachtrij, bezocht = [start_url], set()
+        while wachtrij and len(bezocht) < MAX_PAGES:
+            url = wachtrij.pop(0)
+            if url in bezocht:
                 continue
-            visited.add(url)
+            bezocht.add(url)
 
-            print(f"  -> ophalen: {url}", flush=True)
+            print(f"     ophalen: {url}", flush=True)
             page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
 
-            if len(visited) == 1:
-                _dismiss_cookiebanner(page)
+            if len(bezocht) == 1:
+                for patroon in (weigeren, accepteren):
+                    try:
+                        knop = page.get_by_role("button", name=patroon).first
+                        if knop.count() and knop.is_visible():
+                            knop.click(timeout=3000)
+                            page.wait_for_timeout(500)
+                            break
+                    except (PlaywrightError, AssertionError):
+                        continue
 
-            # Wachten tot de JavaScript het aanbod heeft ingeladen.
             try:
                 page.wait_for_selector('a[href*="/woningaanbod/"]', timeout=20_000)
             except Exception:
                 print("     (geen woninglinks gezien binnen 20s)", flush=True)
             page.wait_for_timeout(2500)
 
-            _click_load_more(page)
+            for _ in range(MAX_LOAD_MORE):
+                try:
+                    knop = page.get_by_role("button", name=meer).first
+                    if not knop.count() or not knop.is_visible():
+                        break
+                    knop.click(timeout=5000)
+                    page.wait_for_timeout(1500)
+                except (PlaywrightError, AssertionError):
+                    break
 
             html = page.content()
-            page_listings = extract_listings(html)
-            print(f"     {len(page_listings)} woning(en) gevonden", flush=True)
-            listings.update(page_listings)
-
-            for next_url in extract_pagination(html):
-                if next_url not in visited and next_url not in queue:
-                    queue.append(next_url)
+            paginas.append(html)
+            for volgende in extract_pagination(html, basis, f"{basis}/woningaanbod"):
+                if volgende not in bezocht and volgende not in wachtrij:
+                    wachtrij.append(volgende)
 
         browser.close()
 
-    return listings
+    return paginas
 
 
 # --------------------------------------------------------------------------
-# Opslag van wat we al gezien hebben
+# Opslag
 # --------------------------------------------------------------------------
 
-def load_state() -> dict:
-    if not STATE_FILE.exists():
+def lees_opslag(bestandsnaam: str) -> dict:
+    pad = HIER / bestandsnaam
+    if not pad.exists():
         return {}
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return json.loads(pad.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        print("! seen.json is beschadigd; ik begin opnieuw.", file=sys.stderr)
+        print(f"! {bestandsnaam} is beschadigd; ik begin voor deze site opnieuw.", file=sys.stderr)
         return {}
 
 
-def save_state(state: dict) -> None:
-    STATE_FILE.write_text(
-        json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+def schrijf_opslag(bestandsnaam: str, gegevens: dict) -> None:
+    (HIER / bestandsnaam).write_text(
+        json.dumps(gegevens, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
 
 # --------------------------------------------------------------------------
-# E-mail versturen
+# Eén site controleren
 # --------------------------------------------------------------------------
 
-def send_email(new_items: list[dict]) -> None:
+def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
+    """
+    Geef (nieuwe woningen, bij te werken opslag) terug.
+
+    Het wegschrijven gebeurt bewust niet hier maar in main(), want dat mag pas
+    zodra de mail ook echt de deur uit is. Bij None ging er iets mis en laten
+    we de opslag met rust, zodat de volgende run het opnieuw probeert.
+    """
+    print(f"\n=== {site['naam']} ===", flush=True)
+    extractor = EXTRACTORS[site["soort"]]
+
+    paginas: list[str] = []
+    try:
+        if site["browser"]:
+            paginas = haal_met_browser(site["url"], site["basis"])
+        else:
+            print(f"     ophalen: {site['url'][:90]}...", flush=True)
+            paginas = [haal_statisch(site["url"])]
+    except (urllib.error.URLError, OSError) as fout:
+        print(f"! Ophalen mislukt: {fout}", file=sys.stderr)
+        return [], None
+
+    huidig: dict[str, dict] = {}
+    for html in paginas:
+        huidig.update(extractor(html, site["basis"]))
+
+    # Terugval: sommige sites laden hun aanbod pas met JavaScript.
+    if not huidig and not site["browser"]:
+        print("     niets gevonden zonder browser; nog een poging mét browser", flush=True)
+        try:
+            for html in haal_met_browser(site["url"], site["basis"]):
+                huidig.update(extractor(html, site["basis"]))
+        except Exception as fout:
+            print(f"! Ook met browser mislukt: {fout}", file=sys.stderr)
+
+    if not huidig:
+        print("! Geen enkele woning gevonden. Opslag blijft ongewijzigd.", file=sys.stderr)
+        return [], None
+
+    # Controle tegen het aantal dat de site zelf noemt.
+    for html in paginas:
+        treffer = AANTAL_RE.search(html)
+        if treffer:
+            verwacht = int(treffer.group(1).replace(".", ""))
+            if len(huidig) < verwacht:
+                print(
+                    f"! Let op: site meldt {verwacht} objecten, ik zie er {len(huidig)}. "
+                    "Waarschijnlijk staat er een tweede pagina.",
+                    file=sys.stderr,
+                )
+            break
+
+    beschikbaar = sum(1 for w in huidig.values() if w["status"] == "beschikbaar")
+    print(f"     {len(huidig)} woning(en), waarvan {beschikbaar} beschikbaar", flush=True)
+
+    opslag = lees_opslag(site["opslag"])
+    eerste_keer = not opslag
+    nu = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    nieuw: list[dict] = []
+    for woning_id, gegevens in huidig.items():
+        vorige = opslag.get(woning_id)
+        vorige_status = vorige.get("status", "beschikbaar") if vorige else None
+        if gegevens["status"] == "beschikbaar" and vorige_status != "beschikbaar":
+            nieuw.append({**gegevens, "site": site["naam"]})
+
+    for woning_id, gegevens in huidig.items():
+        regel = opslag.setdefault(woning_id, {"eerst_gezien": nu})
+        regel.update(gegevens)
+
+    if eerste_keer and os.environ.get("NOTIFY_ON_FIRST_RUN") != "1":
+        print("     eerste run: vastgelegd als uitgangspunt, geen mail", flush=True)
+        return [], opslag
+
+    if not nieuw:
+        print("     geen nieuw aanbod", flush=True)
+        return [], opslag
+
+    print(f"     {len(nieuw)} nieuw(e) woning(en):", flush=True)
+    for woning in nieuw:
+        print(f"       - {woning['title']} | {woning['url']}", flush=True)
+    return nieuw, opslag
+
+
+# --------------------------------------------------------------------------
+# E-mail
+# --------------------------------------------------------------------------
+
+def verstuur_mail(nieuw: list[dict]) -> None:
     host = os.environ["SMTP_HOST"]
-    port = int(os.environ.get("SMTP_PORT", "587"))
-    user = os.environ["SMTP_USER"]
-    password = os.environ["SMTP_PASS"]
-    mail_to = [a.strip() for a in os.environ["MAIL_TO"].split(",") if a.strip()]
-    mail_from = os.environ.get("MAIL_FROM", user)
+    poort = int(os.environ.get("SMTP_PORT", "587"))
+    gebruiker = os.environ["SMTP_USER"]
+    wachtwoord = os.environ["SMTP_PASS"]
+    ontvangers = [a.strip() for a in os.environ["MAIL_TO"].split(",") if a.strip()]
+    afzender = os.environ.get("MAIL_FROM", gebruiker)
 
-    count = len(new_items)
-    subject = (
-        f"Nieuwe huurwoning: {new_items[0]['title']}"
-        if count == 1
-        else f"{count} nieuwe huurwoningen bij At Home Vastgoed"
-    )
+    per_site: dict[str, list[dict]] = {}
+    for woning in nieuw:
+        per_site.setdefault(woning["site"], []).append(woning)
 
-    plain_lines = ["Nieuw op athomevastgoed.nl:", ""]
-    html_rows = []
-    for item in new_items:
-        plain_lines += [f"* {item['title']}", f"  {item['url']}", ""]
-        html_rows.append(
-            f'<li style="margin-bottom:14px">'
-            f'<a href="{item["url"]}" style="font-size:16px;font-weight:600">{item["title"]}</a>'
-            f"</li>"
+    aantal = len(nieuw)
+    if aantal == 1:
+        onderwerp = f"Nieuwe huurwoning: {nieuw[0]['title']} ({nieuw[0]['site']})"
+    else:
+        onderwerp = f"{aantal} nieuwe huurwoningen"
+
+    regels: list[str] = []
+    blokken: list[str] = []
+    for sitenaam, woningen in per_site.items():
+        regels += [f"{sitenaam}:", ""]
+        items = []
+        for woning in woningen:
+            regels += [f"  * {woning['title']}", f"    {woning['url']}", ""]
+            items.append(
+                f'<li style="margin-bottom:12px">'
+                f'<a href="{woning["url"]}" style="font-size:16px;font-weight:600">{woning["title"]}</a>'
+                f"</li>"
+            )
+        blokken.append(
+            f'<h3 style="margin:22px 0 8px;font-size:14px;text-transform:uppercase;'
+            f'letter-spacing:.05em;color:#666">{sitenaam}</h3>'
+            f'<ul style="padding-left:18px;margin:0">{"".join(items)}</ul>'
         )
-    plain_lines.append(LIST_URL)
 
-    message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = mail_from
-    message["To"] = ", ".join(mail_to)
-    message.set_content("\n".join(plain_lines))
-    message.add_alternative(
-        "<html><body style=\"font-family:Helvetica,Arial,sans-serif;color:#222\">"
-        f"<p>Er staat nieuw aanbod online ({count}):</p>"
-        f"<ul style=\"padding-left:18px\">{''.join(html_rows)}</ul>"
-        f'<p style="font-size:13px;color:#666">'
-        f'<a href="{LIST_URL}">Bekijk het volledige aanbod</a></p>'
+    bericht = EmailMessage()
+    bericht["Subject"] = onderwerp
+    bericht["From"] = afzender
+    bericht["To"] = ", ".join(ontvangers)
+    bericht.set_content("\n".join(regels))
+    bericht.add_alternative(
+        '<html><body style="font-family:Helvetica,Arial,sans-serif;color:#222">'
+        f"<p>Nieuw aanbod gevonden ({aantal}):</p>{''.join(blokken)}"
         "</body></html>",
         subtype="html",
     )
 
-    if port == 465:
-        with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context()) as server:
-            server.login(user, password)
-            server.send_message(message)
+    if poort == 465:
+        with smtplib.SMTP_SSL(host, poort, context=ssl.create_default_context()) as server:
+            server.login(gebruiker, wachtwoord)
+            server.send_message(bericht)
     else:
-        with smtplib.SMTP(host, port, timeout=30) as server:
+        with smtplib.SMTP(host, poort, timeout=30) as server:
             server.starttls(context=ssl.create_default_context())
-            server.login(user, password)
-            server.send_message(message)
+            server.login(gebruiker, wachtwoord)
+            server.send_message(bericht)
 
-    print(f"E-mail verstuurd naar {', '.join(mail_to)}", flush=True)
+    print(f"\nE-mail verstuurd naar {', '.join(ontvangers)}", flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -291,52 +474,45 @@ def send_email(new_items: list[dict]) -> None:
 def main() -> int:
     print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}] Controle gestart", flush=True)
 
-    current = fetch_current_listings()
+    resultaten: list[tuple[dict, list[dict], dict]] = []
+    mislukt: list[str] = []
 
-    # Veiligheidsklep: bij nul resultaten is er iets stuk (site plat, layout
-    # gewijzigd, browser mislukt). Dan de opslag NIET overschrijven, anders
-    # zou de volgende run het complete aanbod als 'nieuw' mailen.
-    if not current:
-        print("! Geen enkele woning gevonden. Opslag blijft ongewijzigd.", file=sys.stderr)
-        return 1
+    for site in SITES:
+        try:
+            nieuw, opslag = controleer_site(site)
+        except Exception as fout:  # een kapotte site mag de rest niet blokkeren
+            print(f"! Onverwachte fout bij {site['naam']}: {fout}", file=sys.stderr)
+            mislukt.append(site["naam"])
+            continue
+        if opslag is None:
+            mislukt.append(site["naam"])
+            continue
+        resultaten.append((site, nieuw, opslag))
 
-    print(f"Totaal {len(current)} woning(en) online.", flush=True)
+    alles_nieuw = [woning for _, nieuw, _ in resultaten for woning in nieuw]
 
-    state = load_state()
-    first_run = not state
-    new_ids = [i for i in current if i not in state]
-
-    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    for listing_id, data in current.items():
-        entry = state.setdefault(listing_id, {"eerst_gezien": timestamp})
-        entry.update(data)
-
-    if first_run and os.environ.get("NOTIFY_ON_FIRST_RUN") != "1":
-        save_state(state)
-        print(f"Eerste run: {len(current)} woningen vastgelegd als uitgangspunt. Geen mail.", flush=True)
-        return 0
-
-    if not new_ids:
-        save_state(state)
-        print("Geen nieuw aanbod.", flush=True)
-        return 0
-
-    new_items = [current[i] for i in sorted(new_ids, key=int, reverse=True)]
-    print(f"{len(new_items)} nieuw(e) woning(en):", flush=True)
-    for item in new_items:
-        print(f"  - {item['title']} | {item['url']}", flush=True)
+    if not alles_nieuw:
+        for site, _, opslag in resultaten:
+            schrijf_opslag(site["opslag"], opslag)
+        print("\nNiets nieuws om te melden.", flush=True)
+        return 1 if mislukt else 0
 
     try:
-        send_email(new_items)
-    except KeyError as missing:
-        print(f"! Ontbrekende instelling: {missing}. Opslag niet bijgewerkt.", file=sys.stderr)
+        verstuur_mail(alles_nieuw)
+    except KeyError as ontbreekt:
+        print(f"! Ontbrekende instelling: {ontbreekt}. Opslag niet bijgewerkt.", file=sys.stderr)
         return 1
-    except Exception as error:  # mail mislukt -> state niet opslaan, volgende run probeert opnieuw
-        print(f"! Verzenden mislukt: {error}. Opslag niet bijgewerkt.", file=sys.stderr)
+    except Exception as fout:
+        print(f"! Verzenden mislukt: {fout}. Opslag niet bijgewerkt.", file=sys.stderr)
+        # Sites zonder nieuws mogen wel opslaan; die hebben geen mail nodig.
+        for site, nieuw, opslag in resultaten:
+            if not nieuw:
+                schrijf_opslag(site["opslag"], opslag)
         return 1
 
-    save_state(state)
-    return 0
+    for site, _, opslag in resultaten:
+        schrijf_opslag(site["opslag"], opslag)
+    return 1 if mislukt else 0
 
 
 if __name__ == "__main__":
