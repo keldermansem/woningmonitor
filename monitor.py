@@ -136,6 +136,16 @@ NIET_MEER_RE = re.compile(
     r"|onder\s+optie|\bvol\b\s*$)",
     re.IGNORECASE,
 )
+# Zinnen waarmee een site zelf zegt dat er niets aan je filter voldoet. Dat is
+# een geldig antwoord en dus geen storing - het verschil met "ik kon de pagina
+# niet lezen" is precies waar het om draait.
+LEEG_RE = re.compile(
+    r"(geen\s+(?:objecten|woningen|huurwoningen|resultaten|panden)\s+gevonden"
+    r"|\b0\s+(?:objecten\s+)?gevonden"
+    r"|geen\s+resultaten"
+    r"|sorry,\s*geen)",
+    re.IGNORECASE,
+)
 VERHUURD_RE = re.compile(r"\b(verhuurd|verkocht|onder\s+optie)\b", re.IGNORECASE)
 BESCHIKBAAR_RE = re.compile(r"\b(te\s+huur|te\s+koop|nieuw\s+in\s+verhuur|beschikbaar)\b", re.IGNORECASE)
 STATUS_PREFIX_RE = re.compile(r"^(?:te\s+huur|te\s+koop|verhuurd|verkocht)\s*:\s*", re.IGNORECASE)
@@ -178,6 +188,7 @@ ATHOME_PATH_RE = re.compile(
     r"^(?:https?://(?:www\.)?athomevastgoed\.nl)?(/woningaanbod/[^?#]+)$", re.IGNORECASE
 )
 ATHOME_ID_RE = re.compile(r"-(\d+)/?$")
+POSTCODE_RE = re.compile(r"\b(\d{4}\s?[A-Z]{2})\b")
 
 
 def titel_uit_slug(path: str) -> str:
@@ -200,15 +211,18 @@ def extract_athome(html: str, basis: str) -> dict[str, dict]:
         if not id_match:
             continue
 
-        titel = _beste_titel(match) or titel_uit_slug(pad)
+        # Bewust de straatnaam uit het webadres, niet de langste tekst uit het
+        # kaartje: dat laatste levert prijzen en huurtermijnen op.
+        titel = titel_uit_slug(pad)
+        postcode = POSTCODE_RE.search(_beste_titel(match))
+        if postcode:
+            titel = f"{titel} ({postcode.group(1)})"
         woning_id = id_match.group(1)
-        bestaand = gevonden.get(woning_id)
-        if bestaand is None or len(titel) > len(bestaand["title"]):
-            gevonden[woning_id] = {
-                "title": titel,
-                "url": urljoin(basis, pad),
-                "status": "beschikbaar",  # deze site toont geen status in de lijst
-            }
+        gevonden.setdefault(woning_id, {
+            "title": titel,
+            "url": urljoin(basis, pad),
+            "status": "beschikbaar",  # deze site toont geen status in de lijst
+        })
     return gevonden
 
 
@@ -477,17 +491,32 @@ def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
     for html in paginas:
         huidig.update(extractor(html, site["basis"]))
 
+    def site_meldt_leeg() -> bool:
+        return any(LEEG_RE.search(_clean_text(html)) for html in paginas)
+
+    # Zegt de site zelf dat er niets aan het filter voldoet, dan zijn we klaar.
+    # Dat is een geldig antwoord en geen storing, dus geen browserpoging en
+    # geen foutmelding.
+    if not huidig and site_meldt_leeg():
+        print("     site meldt zelf: geen resultaten voor dit filter", flush=True)
+        return [], lees_opslag(site["opslag"])
+
     # Terugval: sommige sites laden hun aanbod pas met JavaScript.
     if not huidig and not site["browser"]:
         print("     niets gevonden zonder browser; nog een poging mét browser", flush=True)
         try:
-            for html in haal_met_browser(site):
+            paginas = haal_met_browser(site)
+            for html in paginas:
                 huidig.update(extractor(html, site["basis"]))
         except Exception as fout:
             print(f"! Ook met browser mislukt: {fout}", file=sys.stderr)
+        if not huidig and site_meldt_leeg():
+            print("     site meldt zelf: geen resultaten voor dit filter", flush=True)
+            return [], lees_opslag(site["opslag"])
 
     if not huidig:
-        print("! Geen enkele woning gevonden. Opslag blijft ongewijzigd.", file=sys.stderr)
+        print("! Geen enkele woning gevonden en de site zegt niet dat het filter "
+              "leeg is. Opslag blijft ongewijzigd.", file=sys.stderr)
         return [], None
 
     # Controle tegen het aantal dat de site zelf noemt.
