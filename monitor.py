@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from html import unescape
 from pathlib import Path
+from urllib.parse import unquote as url_decode
 from urllib.parse import urljoin
 
 HIER = Path(__file__).parent
@@ -120,6 +121,20 @@ SITES = [
         "soort": "riva",
         "wacht_op": 'a[href*="/object/"]',
     },
+    {
+        "id": "kolpa",
+        "naam": "Kolpa Makelaars",
+        "url": (
+            "https://kolpa.nl/wonen/huur?price.rentals.amount=200%2C1500"
+            "&details.rooms.amount=1%2C7&details.bedrooms.amount=1%2C6"
+            "&details.surface.amount=25%2C229&title_address.city=Rotterdam"
+        ),
+        "basis": "https://kolpa.nl",
+        "opslag": "seen-kolpa.json",
+        "browser": False,
+        "soort": "kolpa",
+        "wacht_op": 'a[href*="/aanbod/"]',
+    },
 ]
 
 MAX_PAGES = 6
@@ -139,7 +154,9 @@ ATTR_TEXT_RE = re.compile(r"(?:title|alt|aria-label)=[\"']([^\"']+)[\"']", re.IG
 PAGINATION_RE = re.compile(
     r"href=[\"']([^\"']*(?:[?&]page=\d+|/page/\d+/?)[^\"']*)[\"']", re.IGNORECASE
 )
-AANTAL_RE = re.compile(r"\b(\d[\d.]*)\s+(?:object(?:en)?\s+)?gevonden\b", re.IGNORECASE)
+AANTAL_RE = re.compile(
+    r"\b(\d[\d.]*)\s+(?:object(?:en)?\s+)?(?:gevonden|resultaten)\b", re.IGNORECASE
+)
 TAG_RE = re.compile(r"<[^>]+>")
 WS_RE = re.compile(r"\s+")
 
@@ -413,11 +430,69 @@ def extract_riva(html: str, basis: str) -> dict[str, dict]:
     return gevonden
 
 
+# --------------------------------------------------------------------------
+# Kolpa Makelaars: /aanbod/<plaats>/<straat-nummer>/<lang objectnummer>
+#
+# De status staat hier in de linktekst zelf ("Verhuurd Rotterdam Helmersstraat
+# 127"), dus per link uitlezen volstaat. De lijst staat standaard gesorteerd op
+# nieuw naar oud, waardoor nieuw aanbod altijd op de eerste pagina verschijnt.
+# --------------------------------------------------------------------------
+
+KOLPA_PATH_RE = re.compile(
+    r"^(?:https?://(?:www\.)?kolpa\.nl)?"
+    r"(/aanbod/[^/?#]+/[^/?#]+/([0-9a-f]{12,}))/?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+KOLPA_PRIJS_RE = re.compile(r"\u20ac\s*([\d.,]+)\s*p\.?\s*m\.?", re.IGNORECASE)
+
+
+def titel_kolpa(pad: str) -> str:
+    """'/aanbod/rotterdam/schepenstraat-88b/6a68...' -> 'Schepenstraat 88B, Rotterdam'."""
+    delen = [url_decode(d) for d in pad.split("/") if d]
+    plaats, adres = delen[-3], delen[-2]
+
+    treffer = HUISNUMMER_RE.match(adres)
+    woorddeel, nummerdeel = (treffer.group(1), treffer.group(2)) if treffer else (adres, "")
+    woorden = []
+    for stand, woord in enumerate(w for w in woorddeel.split("-") if w):
+        woorden.append(woord if stand > 0 and woord in TUSSENVOEGSELS else woord.capitalize())
+
+    straat = " ".join(woorden + ([nummerdeel.upper()] if nummerdeel else []))
+    plaats = " ".join(w.capitalize() for w in plaats.split("-"))
+    return f"{straat}, {plaats}".strip(", ") or "Woning"
+
+
+def extract_kolpa(html: str, basis: str) -> dict[str, dict]:
+    gevonden: dict[str, dict] = {}
+    for match in ANCHOR_RE.finditer(html):
+        pad_match = KOLPA_PATH_RE.match(unescape(match.group("href")).strip())
+        if not pad_match:
+            continue
+        pad = pad_match.group(1).rstrip("/")
+        woning_id = pad_match.group(2).lower()
+        if woning_id in gevonden:
+            continue
+
+        kaartje = _clean_text(match.group(0))
+        titel = titel_kolpa(pad)
+        prijs = KOLPA_PRIJS_RE.search(kaartje)
+        if prijs:
+            titel = f"{titel} - \u20ac{prijs.group(1)} p/m"
+
+        gevonden[woning_id] = {
+            "title": titel[:200],
+            "url": urljoin(basis, pad),
+            "status": "verhuurd" if NIET_MEER_RE.search(kaartje) else "beschikbaar",
+        }
+    return gevonden
+
+
 EXTRACTORS = {
     "athome": extract_athome,
     "rental": extract_rental,
     "indestad": extract_indestad,
     "riva": extract_riva,
+    "kolpa": extract_kolpa,
 }
 
 
