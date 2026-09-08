@@ -107,6 +107,19 @@ SITES = [
         "soort": "indestad",
         "wacht_op": 'a[href*="/huurwoningen/"]',
     },
+    {
+        "id": "rivarentals",
+        "naam": "Riva Rentals",
+        "url": (
+            "https://rivarentals.nl/aanbod/?city=Rotterdam"
+            "&price_min=200&price_max=1400&surface_min=40&surface_max=200"
+        ),
+        "basis": "https://rivarentals.nl",
+        "opslag": "seen-rivarentals.json",
+        "browser": False,
+        "soort": "riva",
+        "wacht_op": 'a[href*="/object/"]',
+    },
 ]
 
 MAX_PAGES = 6
@@ -123,7 +136,9 @@ ANCHOR_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 ATTR_TEXT_RE = re.compile(r"(?:title|alt|aria-label)=[\"']([^\"']+)[\"']", re.IGNORECASE)
-PAGINATION_RE = re.compile(r"href=[\"']([^\"']*[?&]page=\d+[^\"']*)[\"']", re.IGNORECASE)
+PAGINATION_RE = re.compile(
+    r"href=[\"']([^\"']*(?:[?&]page=\d+|/page/\d+/?)[^\"']*)[\"']", re.IGNORECASE
+)
 AANTAL_RE = re.compile(r"\b(\d[\d.]*)\s+(?:object(?:en)?\s+)?gevonden\b", re.IGNORECASE)
 TAG_RE = re.compile(r"<[^>]+>")
 WS_RE = re.compile(r"\s+")
@@ -341,10 +356,68 @@ def extract_indestad(html: str, basis: str) -> dict[str, dict]:
     return gevonden
 
 
+# --------------------------------------------------------------------------
+# Riva Rentals: /object/<straat>-<plaats>-h<nummer>/
+#
+# Het hele kaartje is hier een enkele link, met alle gegevens in de linktekst:
+#   "Bergweg, Rotterdam - 79 m2 - 2 slaapkamers - EUR 2.350/maand Bekijk woning"
+# Daar plukken we oppervlakte en prijs uit voor een bruikbare onderwerpregel.
+# --------------------------------------------------------------------------
+
+RIVA_PATH_RE = re.compile(
+    r"^(?:https?://(?:www\.)?rivarentals\.nl)?(/object/[^/?#]+)/?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+RIVA_ID_RE = re.compile(r"-(h\d+)$", re.IGNORECASE)
+RIVA_DETAILS_RE = re.compile(
+    r"(\d+)\s*m\u00b2\s*-\s*\d+\s*slaapkamer\w*\s*-\s*\u20ac\s*([\d.,]+)",
+    re.IGNORECASE,
+)
+
+
+def titel_riva(pad: str) -> str:
+    """'/object/laan-op-zuid-rotterdam-h178262206' -> 'Laan op Zuid Rotterdam'."""
+    slug = RIVA_ID_RE.sub("", pad.rstrip("/").rsplit("/", 1)[-1])
+    woorden = []
+    for stand, woord in enumerate(w for w in slug.split("-") if w):
+        woorden.append(woord if stand > 0 and woord in TUSSENVOEGSELS else woord.capitalize())
+    return " ".join(woorden) or "Woning"
+
+
+def extract_riva(html: str, basis: str) -> dict[str, dict]:
+    gevonden: dict[str, dict] = {}
+    for match in ANCHOR_RE.finditer(html):
+        pad_match = RIVA_PATH_RE.match(unescape(match.group("href")).strip())
+        if not pad_match:
+            continue
+        pad = pad_match.group(1).rstrip("/")
+        id_match = RIVA_ID_RE.search(pad)
+        if not id_match:
+            continue  # geen objectnummer, dus geen woningkaartje
+
+        woning_id = id_match.group(1).lower()
+        if woning_id in gevonden:
+            continue
+
+        kaartje = _clean_text(match.group(0))
+        titel = titel_riva(pad)
+        details = RIVA_DETAILS_RE.search(kaartje)
+        if details:
+            titel = f"{titel} - {details.group(1)} m\u00b2 - \u20ac{details.group(2)} p/m"
+
+        gevonden[woning_id] = {
+            "title": titel[:200],
+            "url": urljoin(basis, pad + "/"),
+            "status": "verhuurd" if NIET_MEER_RE.search(kaartje) else "beschikbaar",
+        }
+    return gevonden
+
+
 EXTRACTORS = {
     "athome": extract_athome,
     "rental": extract_rental,
     "indestad": extract_indestad,
+    "riva": extract_riva,
 }
 
 
