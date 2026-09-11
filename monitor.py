@@ -5,6 +5,9 @@ Monitor voor nieuw huuraanbod, voor meerdere makelaarssites tegelijk.
 Per site wordt bijgehouden welke woningen al eens langs zijn gekomen. Verschijnt
 er iets nieuws dat ook daadwerkelijk beschikbaar is, dan gaat er een mail uit.
 
+Vertrouw je het filter van een site niet? Laat de filters dan uit de URL en zet
+"max_prijs" en/of "plaats" in het siteblok; dan zeeft het script zelf.
+
 Een site tijdelijk stilleggen zonder hem te verwijderen? Zet "actief": False in
 zijn blok. Handig als een makelaarssite kapot is en je niet elk kwartier een
 foutmelding wilt terwijl je het uitzoekt.
@@ -98,15 +101,19 @@ SITES = [
         "naam": "In de Stad",
         # per_page staat bewust op 50 in plaats van 10: dan past al het
         # gefilterde aanbod op een pagina en hoeft er niet gebladerd te worden.
-        "url": (
-            "https://www.indestad.nl/huurwoningen/?wpp_search%5Bpagination%5D=on"
-            "&wpp_search%5Bper_page%5D=50&wpp_search%5Bstrict_search%5D=false"
-            "&wpp_search%5Bproperty_type%5D=direct_aanbod"
-            "&wpp_search%5Bprice%5D%5Bmin%5D=100&wpp_search%5Bprice%5D%5Bmax%5D=1400"
-            "&wpp_search%5Barea%5D%5Bmin%5D=44&wpp_search%5Barea%5D%5Bmax%5D=200"
-            "&wpp_search%5Bplaats%5D%5B0%5D=Rotterdam"
-        ),
-        "basis": "https://www.indestad.nl",
+        # De site is in september 2026 verbouwd: het aanbod verhuisde van
+        # /huurwoningen/ naar /huuraanbod/ en de filternamen zijn veranderd.
+        # De losse woningpagina's staan nog wel op /huurwoningen/<straat>/.
+        # Bewust ZONDER filters in de URL. Het filter van deze site is niet
+        # betrouwbaar te sturen: laat je een veld leeg, dan negeert hij het
+        # hele filter en toont hij ook woningen boven je prijsgrens. Bovendien
+        # vult deze makelaar oppervlakte en kamers geregeld niet in, waardoor
+        # zijn eigen filter passende woningen wegliet. We halen daarom alles
+        # op en zeven hieronder zelf op prijs en plaats.
+        "url": "https://indestad.nl/huuraanbod/",
+        "max_prijs": 1500,
+        "plaats": "Rotterdam",
+        "basis": "https://indestad.nl",
         "opslag": "seen-indestad.json",
         "browser": False,
         "soort": "indestad",
@@ -179,6 +186,7 @@ NIET_MEER_RE = re.compile(
 # niet lezen" is precies waar het om draait.
 LEEG_RE = re.compile(
     r"(geen\s+(?:objecten|woningen|huurwoningen|resultaten|panden)\s+gevonden"
+    r"|geen\s+woningen\s+gevonden\s+die"
     r"|\b0\s+(?:objecten\s+)?gevonden"
     r"|geen\s+resultaten"
     r"|sorry,\s*geen)",
@@ -321,9 +329,10 @@ INDESTAD_PATH_RE = re.compile(
 )
 HREF_RE = re.compile(r"href=[\"'\']([^\"'\']+)[\"'\']", re.IGNORECASE)
 HUISNUMMER_RE = re.compile(r"^(.*?)-((?:\d+[a-z]?)(?:-\d+[a-z]?)*)$", re.IGNORECASE)
-PRIJS_RE = re.compile(r"\u20ac\s*([\d.,]+)\s*p/m", re.IGNORECASE)
+PRIJS_RE = re.compile(r"\u20ac\s*([\d.,]+)\s*(?:p/m|/\s*mnd|p\.?\s*m\.?)", re.IGNORECASE)
 
 TUSSENVOEGSELS = {"de", "den", "der", "het", "van", "aan", "op", "ter", "te", "in", "bij", "'t"}
+POSTCODE_PLAATS_RE = re.compile(r"\b\d{4}\s?[A-Z]{2}\s*,?\s+([A-Z][a-zA-Z\-']+)")
 LABEL_TERUGBLIK = 800  # tekens vóór een kaartje waarin we naar het label kijken
 
 
@@ -368,13 +377,22 @@ def extract_indestad(html: str, basis: str) -> dict[str, dict]:
 
         titel = titel_indestad(pad)
         prijs = PRIJS_RE.search(kaartje)
+        bedrag = None
         if prijs:
             titel = f"{titel} - \u20ac{prijs.group(1)} p/m"
+            try:
+                bedrag = int(float(prijs.group(1).replace(".", "").replace(",", ".")))
+            except ValueError:
+                bedrag = None
+
+        stad = POSTCODE_PLAATS_RE.search(kaartje)
 
         gevonden[woning_id] = {
             "title": titel[:200],
             "url": urljoin(basis, pad + "/"),
             "status": "verhuurd" if NIET_MEER_RE.search(kaartje) else "beschikbaar",
+            "prijs": bedrag,
+            "plaats": stad.group(1) if stad else None,
         }
     return gevonden
 
@@ -562,8 +580,12 @@ def haal_met_browser(site: dict) -> list[str]:
                 continue
             bezocht.add(url)
 
-            print(f"     ophalen: {url}", flush=True)
-            page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+            print(f"     ophalen: {url[:90]}...", flush=True)
+            antwoord = page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+            if antwoord is not None and antwoord.status >= 400:
+                # Zonder deze regel lijkt het alsof de pagina prima laadt, terwijl
+                # de server in werkelijkheid een foutpagina teruggeeft.
+                print(f"     let op: de site antwoordt met HTTP {antwoord.status}", flush=True)
 
             if len(bezocht) == 1:
                 for patroon in (weigeren, accepteren):
@@ -641,6 +663,7 @@ def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
     extractor = EXTRACTORS[site["soort"]]
 
     paginas: list[str] = []
+    browser_gebruikt = site["browser"]
     try:
         if site["browser"]:
             paginas = haal_met_browser(site)
@@ -657,6 +680,7 @@ def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
             return [], None
         try:
             paginas = haal_met_browser(site)
+            browser_gebruikt = True
         except Exception as browserfout:
             print(f"! Ophalen mislukt, ook met browser: {fout} / {browserfout}", file=sys.stderr)
             return [], None
@@ -676,10 +700,11 @@ def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
         return [], lees_opslag(site["opslag"])
 
     # Terugval: sommige sites laden hun aanbod pas met JavaScript.
-    if not huidig and not site["browser"]:
+    if not huidig and not browser_gebruikt:
         print("     niets gevonden zonder browser; nog een poging mét browser", flush=True)
         try:
             paginas = haal_met_browser(site)
+            browser_gebruikt = True
             for html in paginas:
                 huidig.update(extractor(html, site["basis"]))
         except Exception as fout:
@@ -705,6 +730,26 @@ def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
                     file=sys.stderr,
                 )
             break
+
+    # Zelf zeven op prijs en plaats, voor sites waar het eigen filter niet
+    # te vertrouwen is. Woningen zonder prijs of plaats laten we staan:
+    # liever een woning te veel in de mail dan een gemiste.
+    grens = site.get("max_prijs")
+    if grens:
+        te_duur = [i for i, w in huidig.items() if w.get("prijs") and w["prijs"] > grens]
+        for i in te_duur:
+            del huidig[i]
+        if te_duur:
+            print(f"     {len(te_duur)} woning(en) boven \u20ac{grens} overgeslagen", flush=True)
+
+    stad = site.get("plaats")
+    if stad:
+        elders = [i for i, w in huidig.items()
+                  if w.get("plaats") and w["plaats"].lower() != stad.lower()]
+        for i in elders:
+            del huidig[i]
+        if elders:
+            print(f"     {len(elders)} woning(en) buiten {stad} overgeslagen", flush=True)
 
     beschikbaar = sum(1 for w in huidig.values() if w["status"] == "beschikbaar")
     print(f"     {len(huidig)} woning(en), waarvan {beschikbaar} beschikbaar", flush=True)
