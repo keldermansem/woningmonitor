@@ -5,6 +5,10 @@ Monitor voor nieuw huuraanbod, voor meerdere makelaarssites tegelijk.
 Per site wordt bijgehouden welke woningen al eens langs zijn gekomen. Verschijnt
 er iets nieuws dat ook daadwerkelijk beschikbaar is, dan gaat er een mail uit.
 
+Een site tijdelijk stilleggen zonder hem te verwijderen? Zet "actief": False in
+zijn blok. Handig als een makelaarssite kapot is en je niet elk kwartier een
+foutmelding wilt terwijl je het uitzoekt.
+
 Nieuwe site toevoegen? Zet er een blok bij in SITES hieronder. Sites die hun
 aanbod pas met JavaScript inladen krijgen "browser": True; de rest niet, want
 zonder browser is een controle een paar seconden in plaats van een minuut.
@@ -107,6 +111,8 @@ SITES = [
         "browser": False,
         "soort": "indestad",
         "wacht_op": 'a[href*="/huurwoningen/"]',
+        # Zet op False als deze site blijft weigeren en je even rust wilt.
+        "actief": True,
     },
     {
         "id": "rivarentals",
@@ -509,10 +515,20 @@ def extract_pagination(html: str, basis: str, prefix: str) -> list[str]:
 # Pagina's ophalen
 # --------------------------------------------------------------------------
 
+KOPTEKSTEN = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+
+
 def haal_statisch(url: str) -> str:
-    verzoek = urllib.request.Request(
-        url, headers={"User-Agent": USER_AGENT, "Accept-Language": "nl-NL,nl;q=0.9"}
-    )
+    verzoek = urllib.request.Request(url, headers=KOPTEKSTEN)
     with urllib.request.urlopen(verzoek, timeout=30) as antwoord:
         ruw = antwoord.read()
         codering = antwoord.headers.get_content_charset() or "utf-8"
@@ -632,8 +648,18 @@ def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
             print(f"     ophalen: {site['url'][:90]}...", flush=True)
             paginas = [haal_statisch(site["url"])]
     except (urllib.error.URLError, OSError) as fout:
-        print(f"! Ophalen mislukt: {fout}", file=sys.stderr)
-        return [], None
+        # Een weigering (404, 403, time-out) betekent vaak dat de site geen kale
+        # verzoeken accepteert. Een echte browser komt er dan meestal wel door,
+        # dus geven we niet meteen op.
+        print(f"     ophalen mislukt ({fout}); nog een poging m\u00e9t browser", flush=True)
+        if site["browser"]:
+            print(f"! Ophalen mislukt: {fout}", file=sys.stderr)
+            return [], None
+        try:
+            paginas = haal_met_browser(site)
+        except Exception as browserfout:
+            print(f"! Ophalen mislukt, ook met browser: {fout} / {browserfout}", file=sys.stderr)
+            return [], None
 
     huidig: dict[str, dict] = {}
     for html in paginas:
@@ -795,6 +821,9 @@ def main() -> int:
     mislukt: list[str] = []
 
     for site in SITES:
+        if not site.get("actief", True):
+            print(f"\n=== {site['naam']} === (uitgezet, wordt overgeslagen)", flush=True)
+            continue
         try:
             nieuw, opslag = controleer_site(site)
         except Exception as fout:  # een kapotte site mag de rest niet blokkeren
