@@ -30,6 +30,7 @@ import re
 import smtplib
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -651,7 +652,29 @@ def schrijf_opslag(bestandsnaam: str, gegevens: dict) -> None:
 # Eén site controleren
 # --------------------------------------------------------------------------
 
-def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
+def meld_storing(site: dict, reden: str) -> tuple[list, None, bool]:
+    """
+    Houd bij hoe vaak een site achter elkaar niets bruikbaars teruggeeft.
+
+    Losse missers zijn normaal: makelaarssites hebben botbeveiliging die
+    datacenter-adressen af en toe een blokkadepagina voorschotelt. Daar wil je
+    geen mail over. Pas als het meerdere keren op rij misgaat, is er echt iets
+    aan de hand en mag de run rood kleuren.
+    """
+    opslag = lees_opslag(site["opslag"])
+    aantal = int(opslag.get("_storingen", 0)) + 1
+    opslag["_storingen"] = aantal
+    schrijf_opslag(site["opslag"], opslag)
+
+    grens = site.get("storingsgrens", 3)
+    if aantal < grens:
+        print(f"     {reden} ({aantal}x op rij; vanaf {grens}x meld ik het)", flush=True)
+        return [], None, False
+    print(f"! {reden} - {aantal} keer op rij mis. Hier is echt iets stuk.", file=sys.stderr)
+    return [], None, True
+
+
+def controleer_site(site: dict) -> tuple[list[dict], dict | None, bool]:
     """
     Geef (nieuwe woningen, bij te werken opslag) terug.
 
@@ -676,14 +699,12 @@ def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
         # dus geven we niet meteen op.
         print(f"     ophalen mislukt ({fout}); nog een poging m\u00e9t browser", flush=True)
         if site["browser"]:
-            print(f"! Ophalen mislukt: {fout}", file=sys.stderr)
-            return [], None
+            return meld_storing(site, f"ophalen mislukt: {fout}")
         try:
             paginas = haal_met_browser(site)
             browser_gebruikt = True
         except Exception as browserfout:
-            print(f"! Ophalen mislukt, ook met browser: {fout} / {browserfout}", file=sys.stderr)
-            return [], None
+            return meld_storing(site, f"ophalen mislukt, ook met browser: {fout}")
 
     huidig: dict[str, dict] = {}
     for html in paginas:
@@ -697,11 +718,30 @@ def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
     # geen foutmelding.
     if not huidig and site_meldt_leeg():
         print("     site meldt zelf: geen resultaten voor dit filter", flush=True)
-        return [], lees_opslag(site["opslag"])
+        schoon = lees_opslag(site["opslag"])
+        schoon.pop("_storingen", None)
+        return [], schoon, False
 
     # Terugval: sommige sites laden hun aanbod pas met JavaScript.
+    # Korte tweede poging: een losse blokkadepagina is vaak bij de volgende
+    # aanvraag alweer voorbij, en dat scheelt het starten van een browser.
     if not huidig and not browser_gebruikt:
-        print("     niets gevonden zonder browser; nog een poging mét browser", flush=True)
+        print("     niets gevonden; nog een poging over 5 seconden", flush=True)
+        time.sleep(5)
+        try:
+            paginas = [haal_statisch(site["url"])]
+            for html in paginas:
+                huidig.update(extractor(html, site["basis"]))
+        except (urllib.error.URLError, OSError):
+            pass
+        if not huidig and site_meldt_leeg():
+            print("     site meldt zelf: geen resultaten voor dit filter", flush=True)
+            schoon = lees_opslag(site["opslag"])
+            schoon.pop("_storingen", None)
+            return [], schoon, False
+
+    if not huidig and not browser_gebruikt:
+        print("     nog steeds niets; nu mét browser", flush=True)
         try:
             paginas = haal_met_browser(site)
             browser_gebruikt = True
@@ -714,9 +754,7 @@ def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
             return [], lees_opslag(site["opslag"])
 
     if not huidig:
-        print("! Geen enkele woning gevonden en de site zegt niet dat het filter "
-              "leeg is. Opslag blijft ongewijzigd.", file=sys.stderr)
-        return [], None
+        return meld_storing(site, "geen woningen gevonden en geen 'filter leeg'-melding")
 
     # Controle tegen het aantal dat de site zelf noemt.
     for html in paginas:
@@ -755,7 +793,8 @@ def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
     print(f"     {len(huidig)} woning(en), waarvan {beschikbaar} beschikbaar", flush=True)
 
     opslag = lees_opslag(site["opslag"])
-    eerste_keer = not opslag
+    opslag.pop("_storingen", None)  # geslaagd, dus teller weer op nul
+    eerste_keer = not any(k for k in opslag if not k.startswith("_"))
     nu = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     nieuw: list[dict] = []
@@ -771,16 +810,16 @@ def controleer_site(site: dict) -> tuple[list[dict], dict | None]:
 
     if eerste_keer and os.environ.get("NOTIFY_ON_FIRST_RUN") != "1":
         print("     eerste run: vastgelegd als uitgangspunt, geen mail", flush=True)
-        return [], opslag
+        return [], opslag, False
 
     if not nieuw:
         print("     geen nieuw aanbod", flush=True)
-        return [], opslag
+        return [], opslag, False
 
     print(f"     {len(nieuw)} nieuw(e) woning(en):", flush=True)
     for woning in nieuw:
         print(f"       - {woning['title']} | {woning['url']}", flush=True)
-    return nieuw, opslag
+    return nieuw, opslag, False
 
 
 # --------------------------------------------------------------------------
@@ -870,13 +909,14 @@ def main() -> int:
             print(f"\n=== {site['naam']} === (uitgezet, wordt overgeslagen)", flush=True)
             continue
         try:
-            nieuw, opslag = controleer_site(site)
+            nieuw, opslag, ernstig = controleer_site(site)
         except Exception as fout:  # een kapotte site mag de rest niet blokkeren
             print(f"! Onverwachte fout bij {site['naam']}: {fout}", file=sys.stderr)
             mislukt.append(site["naam"])
             continue
         if opslag is None:
-            mislukt.append(site["naam"])
+            if ernstig:
+                mislukt.append(site["naam"])
             continue
         resultaten.append((site, nieuw, opslag))
 
